@@ -1,0 +1,9 @@
+{
+    "capacity":{
+        "1": {"cache_hit":32},
+        "2": {"cache_hit":31},
+        "3": {"cache_hit":33},
+        "4": {"cache_hit":1000},
+        "5": {"cache_hit":1000}
+    }
+}
