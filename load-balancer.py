@@ -11,9 +11,10 @@ import time
 class Node(object):
     """Represents a single nodes capacity and load."""
     id_ = None
-    capacity = None
-    expr = None
+    expr = []
     load = {}
+    required_expr = []
+    online = True
 
     def __init__(self, **kwargs):
         for key, val in kwargs.items():
@@ -27,59 +28,14 @@ def _load_file(file):
 def _parse_config(config):
     """Parse the JSON configuration into objects."""
     nodes = {}
-    for id_, capacity in config['capacity'].items():
-        nodes[id_] = Node(id_=id_, capacity=capacity)
-    return nodes
-
-def _update_load(options, nodes):
-    """Update node data from the nodes themselves."""
-    for id_, node in nodes.items():
-        result = _do_opencache_call('stat', options, id_, '*')
-        node.load['cache_miss'] = int(result['total_cache_miss'])
-        node.load['cache_miss_size'] = int(result['total_cache_miss_size'])
-        node.load['cache_hit'] = int(result['total_cache_hit'])
-        node.load['cache_hit_size'] = int(result['total_cache_hit_size'])
-        node.load['cache_object'] = int(result['total_cache_object'])
-        node.load['cache_object_size'] = int(result['total_cache_object_size'])
-        node.expr = list(result['expr_seen'])
-
-def _check_thresholds(nodes):
-    """Check to see which metrics are exceeding their thresholds."""
-    overloaded = []
+    for key, dict_ in config.items():
+        for id_, value in dict_.items():
+            if id_ not in nodes:
+                nodes[id_] = Node(id_=id_)
+            setattr(nodes[id_], key, value)
     for node in nodes.values():
-        for metric in node.capacity.keys():
-            if node.load[metric] > node.capacity[metric]:
-                overloaded.append(({'node': node, 'metric': metric}))
-    return overloaded
-
-def _find_node_to_move_to(nodes, metric, load):
-    """
-    Find the most appropriate node to move the load to.
-
-    List of nodes is randomised to create a 'round-robin' effect.
-
-    """
-    keys = list(nodes.keys())
-    random.shuffle(keys)
-    nodes = [(key, nodes[key]) for key in keys]
-    for _, node in nodes:
-        if node.load[metric] < node.capacity[metric] + int(load):
-            return node
-    return None, None
-
-def _find_expr_to_move(options, node, metric):
-    """ Find the most appropriate expression to move on the given node."""
-    load = []
-    key = 'total_' + str(metric)
-    for expr in node.expr:
-        result = _do_opencache_call('stat', options, node.id_, expr)
-        load.append({'expr': expr, 'load': int(result[key])})
-    load.sort(key=lambda tup: tup['load'])
-    to_move = node.load[metric] - node.capacity[metric]
-    for item in load:
-        if item['load'] > to_move:
-            return item['expr'], item['load']
-    return None, None
+        print node.required_expr
+    return nodes
 
 def _do_opencache_call(method, options, node, expr, call_id=None):
     """Make a JSON-RPC call to the OpenCache controller."""
@@ -106,14 +62,122 @@ def _do_opencache_call(method, options, node, expr, call_id=None):
         except Exception as exception:
             print "[ERROR] Could not decode JSON from OpenCache node response: %s" % exception
     except IOError as exception:
-        print "[ERROR] Could not connect to OpenCache instance: %s" % exception
+        #print "[ERROR] Could not connect to OpenCache instance: %s" % exception
+        return {}
 
+def _update(options, nodes):
+    """Update node data from the nodes themselves."""
+    for id_, node in nodes.items():
+        _do_opencache_call('refresh', options, id_, '*')
+        try:
+            result = _do_opencache_call('stat', options, id_, '*')['result']
+            node_id_seen = int(result['node_id_seen'])
+            if node_id_seen == 1:
+                node.online = True
+            elif node_id_seen > 1:
+                print "[ERROR] That's weird, seen more than 1 node ID in the result."
+            node.load['cache_miss'] = int(result['total_cache_miss'])
+            node.load['cache_miss_size'] = int(result['total_cache_miss_size'])
+            node.load['cache_hit'] = int(result['total_cache_hit'])
+            node.load['cache_hit_size'] = int(result['total_cache_hit_size'])
+            node.load['cache_object'] = int(result['total_cache_object'])
+            node.load['cache_object_size'] = int(result['total_cache_object_size'])
+            node.expr = list(result['expr_seen'])
+        except Exception as e:
+            print "[ERROR] %s" % str(e)
 
-def _move_expr(options, expr, overloaded, target):
+def _check_thresholds(nodes):
+    """Check to see which metrics are exceeding their thresholds."""
+    overloaded = []
+    for node in nodes.values():
+        for metric in node.capacity.keys():
+            if node.load[metric] > node.capacity[metric]:
+                overloaded.append(({'node': node, 'metric': metric}))
+    return overloaded
+
+def _find_node_to_move_to(nodes, metric='', load=0):
+    """
+    Find the most appropriate node to move the load to.
+
+    List of nodes is randomised to create a 'round-robin' effect.
+
+    """
+    keys = list(nodes.keys())
+    random.shuffle(keys)
+    nodes = [(key, nodes[key]) for key in keys]
+    for _, node in nodes:
+        if node.online:
+            if metric is not '' or load is not 0:
+                if (node.load[metric] < node.capacity[metric] + int(load)):
+                    return node
+            else:
+                return node
+    return None
+
+def _find_expr_to_move(options, node, metric):
+    """ Find the most appropriate expression to move on the given node."""
+    load = []
+    key = 'total_' + str(metric)
+    for expr in node.expr:
+        _do_opencache_call('refresh', options, node.id_, expr)
+        try:
+            result = _do_opencache_call('stat', options, node.id_, expr)['result']
+            load.append({'expr': expr, 'load': int(result[key])})
+        except Exception as e:
+            print "[ERROR] %s" % str(e)
+    load.sort(key=lambda tup: tup['load'])
+    to_move = node.load[metric] - node.capacity[metric]
+    for item in load:
+        if item['load'] > to_move:
+            return item['expr'], item['load']
+    return None, None
+
+def _move_expr(options, expr, to_node, from_node=None):
     """Call the OpenCache API to move the content between nodes."""
-    _do_opencache_call('pause', options, overloaded, expr)  #TODO: check for success of earlier command
-    _do_opencache_call('start', options, target, expr)
-    _do_opencache_call('stop', options, overloaded, expr)
+    if from_node:
+        _do_opencache_call('pause', options, from_node, expr)  #TODO: check for success of earlier command
+        _do_opencache_call('start', options, to_node, expr)
+        _do_opencache_call('stop', options, from_node, expr)
+    else:
+        _do_opencache_call('start', options, to_node, expr)
+
+
+def _do_load_balancing(options, nodes):
+    overloaded = _check_thresholds(nodes)
+    for item in overloaded:
+        expr_to_move, load = _find_expr_to_move(options, item['node'], item['metric'])
+        if not expr_to_move:
+            print "[ERROR] No expression found to move from overloaded node."
+            break
+        node_to_move_to = _find_node_to_move_to(nodes, item['metric'], load)
+        if not node_to_move_to:
+            print "[ERROR] No node found to move load to."
+            break
+        _move_expr(options, expr_to_move, item['node'].id_,
+                   node_to_move_to.id_)
+
+def _check_required(nodes):
+    missing = []
+    for node in nodes.values():
+        if node.online:
+            diff = set.difference(set(node.required_expr), set(node.expr))
+        else:
+            diff = node.required_expr
+        if len(diff):
+            missing.append({'node': node, 'expr': list(diff)})
+    return missing
+
+def _amend_required_expr(node_to_move_to, node_to_move_from, expr):
+    node_to_move_to.required_expr.append(expr)
+    node_to_move_from.required_expr.remove(expr)
+
+def _do_fail_checking(options, nodes):
+    missing = _check_required(nodes)
+    for item in missing:
+        for expr in item['expr']:
+            node_to_move_to = _find_node_to_move_to(nodes)
+            _move_expr(options, expr, node_to_move_to)
+            _amend_required_expr(node_to_move_to, item['node'], expr)
 
 def _parse_options():
     """Parse the command line options given."""
@@ -126,6 +190,10 @@ def _parse_options():
                       help="path of load balancer configuration")
     parser.add_option("-d", "--delay", dest="delay", default=10,
                       help="delay between load balancing operations")
+    parser.add_option("--no-fail", dest="fail", default=True,
+                      action="store_false", help="inhibit failover protection")
+    parser.add_option("--no-load", dest="load", default=True,
+                      action="store_false", help="inhibit load balancing")
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -137,17 +205,9 @@ if __name__ == '__main__':
         exit()
     nodes = _parse_config(config)
     while True:
-        _update_load(options, nodes)
-        overloaded = _check_thresholds(nodes)
-        for item in overloaded:
-            expr_to_move, load = _find_expr_to_move(options, item['node'], item['metric'])
-            if not expr_to_move:
-                print "[ERROR] No expression found to move from overloaded node."
-                break
-            node_to_move_to = _find_node_to_move_to(nodes, item['metric'], load)
-            if not node_to_move_to:
-                print "[ERROR] No node found to move load to."
-                break
-            _move_expr(options, expr_to_move, item['node'].id_,
-                       node_to_move_to.id_)
+        _update(options, nodes)
+        if options.fail:
+            _do_fail_checking(options, nodes)
+        if options.load:
+            _do_load_balancing(options, nodes)
         time.sleep(float(options.delay))
